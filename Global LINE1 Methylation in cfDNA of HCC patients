@@ -1,4 +1,41 @@
-## Line 1 Methylation in the cfDNA of HCC patients
+# Line 1 Methylation in the cfDNA of HCC patients
+In hepatocellular carcinoma (HCC), Long Interspersed Nuclear Element-1 (LINE-1) elements play a significant role in tumorigenesis through alterations in DNA methylation. Studies have shown that LINE-1 hypomethylation is commonly found in HCC tumors, contributing to genomic instability and impacting clinicopathologic features Kim et al. (2009). This hypomethylation of LINE-1 has been associated with early tumorigenesis in HCC, suggesting its involvement in the initiation of liver cancer (Piao et al., 2014). Furthermore, the detection of LINE-1 hypomethylation in peripheral white blood cells and plasma DNA of HCC patients highlights its potential as a surrogate marker for global hypomethylation in HCC (Zhang et al., 2011).
+
+The below code conducts the following: 
+1. Data Loading and Preparation:
+Loads genomic coordinates of LINE-1 elements from a UCSC database.
+Loads methylation data for HCC and control samples.
+Filters for LINE-1 elements and overlaps methylation data with LINE-1 regions.
+Calculates total methylation counts and beta values for each LINE-1 element.
+
+2.Methylation Data Processing:
+Processes methylation data in parallel, calculates the proportion of methylated cytosines (beta values), and combines results for all samples.
+
+3. Patient Metadata Import:
+Imports metadata for the samples, renames columns, and prepares the data for further analysis.
+
+4.Descriptive Statistics:
+Summarizes the distribution of beta values for methylation across different groups (HCC and control).
+
+5. Visualization:
+Creates a box plot to compare beta values between cases (HCC) and controls.
+Performs Principal Component Analysis (PCA) to visualize the data and plot the first two principal components.
+Creates a scree plot to show the variance explained by each principal component.
+Plots a matrix of scatterplots showing relationships between the first 6 principal components.
+Generates a heatmap to visualize the distribution of beta values for regions with high loading on the second principal component.
+
+6.Differential Methylation Analysis:
+Performs a Wilcoxon rank-sum test to identify significant differences in methylation between HCC and control groups for each LINE-1 element.
+P-value Distribution and Significance Filtering:
+Plots the distribution of p-values from the differential methylation analysis.
+Filters significant results based on a p-value threshold and visualizes these significant beta values with a box plot.
+
+7 Significant Regions Heatmap:
+Generates a heatmap for significant methylation regions, showing the clustering of samples and highlighting differences between HCC and control groups.
+
+
+8 Save Results:
+Saves the list of significant LINE-1 regions to a file for use in other scripts.
 
 # Load packages
 library(data.table)
@@ -17,15 +54,224 @@ library(NMF)
 library(fastcluster)
 
 
-
-#### Data Loading
-We downloaded the repeatmasker track from UCSC as a database dump in csv format.
-We now need to subset to the genomic coordinates of Line1 elements only:
-
+########## Data Loading ##########
+#We downloaded the repeatmasker track from UCSC as a database dump in csv format.
 repeats <- fread("../Data/repeats.tsv.gz", header=TRUE, stringsAsFactors = TRUE)
 # Filter for Line1 repeats only
 repeats <- repeats[repFamily == "L1", .(genoName, genoStart, genoEnd, repName)]
 # make column names less insane, index by chr/start/end
-
 setnames(repeats, c("genoName", "genoStart", "genoEnd"), c("chr", "start", "end"))
 setkey(repeats, chr, start, end)
+
+output_file <- "../Data/Line1Methylation.tsv.gz"  # Update with the desired file path
+# Check if the file exists
+if(file.exists(output_file)) {
+  # If the file exists, read it into LINE1Methylation variable
+  LINE1Methylation <- fread(output_file,  header=TRUE, stringsAsFactors = TRUE)
+} else {
+# If the file does not exist, load methylation calls data samples
+  samples <- list.files("/gpfs3/well/ludwig/users/ikb109/Deliver_calls/1.2/MethylationCalls", pattern = "*.tbi$", full.names = TRUE)
+  samples <- gsub('.tbi', '', samples, fixed = TRUE)
+  names(samples) <- gsub('.calls.bed.gz','', basename(samples), fixed=TRUE)
+
+  # Parallel processing setup
+  plan(multisession, workers = 6)
+  repeats[, start := start + 1]
+  
+  setkey(repeats, chr, start, end)
+  
+  # Process with progress
+  with_progress({
+    p <- progressor(steps = length(samples))
+    # Map over samples and process methylation data
+    methylation.LINE1 <- future_map(samples, function(file) {
+      # Read data from file
+      meth <- fread(file, header=TRUE, stringsAsFactors=TRUE, select=c(1:3, 7:8), na.strings = c("", "*", "."))
+      setnames(meth, c("chr", "start", "end", "unmod", "mod"))
+      # Convert mod and unmod columns to numeric
+      meth[, start := start + 1]
+      setkey(meth, chr, start, end)
+      # Perform overlap operation with repeats data and calculate counts, mod, and unmod
+      data <- foverlaps(meth, repeats, nomatch=NULL)[, .(chr, pos=i.start, mod, unmod, LINE1id=repName, repStart=start, repEnd=end)][, .(count=.N, mod=sum(mod, na.rm = TRUE), unmod=sum(unmod, na.rm = TRUE)), by=.(chr, repStart, repEnd, LINE1id)]
+
+      data[, beta := mod/(mod+unmod), by=.(chr, repStart=repStart-1, repEnd, LINE1id)]
+
+      p() # Update progress
+
+      # Return data with beta values included
+      return(data)
+    })
+  })
+
+  # Combine all processed samples into a single data table
+  LINE1MethylationOverlap <- rbindlist(methylation.LINE1, idcol = "sample")
+
+  # Write the combined data table to the file
+  fwrite(LINE1MethylationOverlap, output_file, quote = FALSE, sep = "\t", compress = "gzip", row.names = FALSE)
+}
+
+
+
+########## Import Patient MetaData ##########
+metadata <- fread("../Data/metadata_HCC.txt", header=TRUE)
+setnames(metadata, 1, "SID")
+setkey(metadata, sample)
+metadata[, Cohort:= gsub("*", "", Cohort, fixed=TRUE)]
+setnames(metadata, "Liver Disease", "LiverDisease")
+
+
+########## Descriptive/ Summary Statistics ###########
+LINE1Methylation <- LINE1Methylation[, list(sample, chr, repStart, repEnd, LINE1id, count, mod, unmod, beta)]
+LINE1Methylation <- LINE1Methylation %>%
+  mutate(group = case_when(
+    grepl("control", sample, ignore.case = TRUE) ~ "Control",
+    grepl("HCC", sample, ignore.case = TRUE) ~ "Case",
+    TRUE ~ "Unknown"
+  ))
+
+# Remove beta values of 0 before running summary statistics 
+# LINE1Methylation <- LINE1Methylation[beta != 0] 
+
+# Summarize the distribution of beta values
+beta_stats <- LINE1Methylation %>%
+  group_by(group) %>%
+  summarise(
+    mean_beta = mean(beta, na.rm = TRUE),
+    median_beta = median(beta, na.rm = TRUE),
+    sd_beta = sd(beta, na.rm = TRUE),
+    min_beta = min(beta, na.rm = TRUE),
+    max_beta = max(beta, na.rm = TRUE),
+    n = n()
+  )
+
+print(beta_stats)
+
+
+
+# Box plot
+LINE1Methylation$group <- as.factor(LINE1Methylation$group)
+
+# Create the box plot using ggplot2
+ggplot(LINE1Methylation, aes(x = group, y = beta, fill = group)) +
+  geom_boxplot() +
+  labs(title = "Box Plot of Beta Values Between Cases and Controls",
+       x = "Group",
+       y = "Beta Value") +
+  theme_minimal()
+
+
+
+########## Conduct Principle Component Analysis #########
+
+# Ensure LINE1Methylation is a data.table
+setDT(LINE1Methylation)
+# Step 1: Pivot the data to have chr + repStart + repEnd as rows and samples as columns
+pivot_df <- dcast(LINE1Methylation, sample ~ chr + repStart + repEnd, value.var = "beta", fill = NA)
+# Convert pivot_df to a data.table (if not already)
+setDF(pivot_df)
+# Extract sample names and group labels
+sample_names <- pivot_df$sample  # Extract sample names
+group_labels <- ifelse(grepl("control", sample_names, ignore.case = TRUE), "Control", "Case")
+# Ensure chr + repStart + repEnd columns are used as rownames for clarity
+rownames(pivot_df) <- sample_names
+pivot_df <- t(pivot_df[, -1])  # Transpose and remove the sample column
+# Remove rows with all zeros or NAs
+null_rows <- apply(pivot_df, 1, function(col) all(col == 0 | is.na(col)))
+pivot_df <- pivot_df[!null_rows, ]
+# Remove columns with zero variance
+var_rows <- apply(pivot_df, 1, var, na.rm = TRUE) > 0
+pivot_df <- pivot_df[var_rows, ]
+#Remove rows with NA values
+pivot_df <- pivot_df[complete.cases(pivot_df), ]
+# Perform PCA
+pca_result <- prcomp(t(pivot_df), scale. = TRUE)
+# Create a data frame for plotting PCA results
+pca_df <- data.frame(pca_result$x)
+pca_df$sample <- sample_names  # Assign correct sample names
+pca_df$group <- group_labels
+
+
+# Plots a matrix of scatterplots showing relationships between the first 6 principal components extracted from a PCA analysis, with points colored based on the "Case" (HCC) and "Control" labels. 
+# Select the number of principal components to include
+num_components <- 6  
+# Extract the first num_components principal components from pca_df
+pc_vars <- pca_df[, paste0("PC", 1:num_components)]
+# Combine with group labels
+pc_vars <- cbind(pc_vars, group = pca_df$group)
+# Create the ggpairs plot
+ggpairs(pc_vars, mapping = aes(color = group))
+# Plot PCA
+ggplot(pca_df, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 3) +
+  labs(title = "PCA Plot", x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+# Check the distribution of variance explained by each principal component,
+# Plot the variance explained by each principal component
+plot(pca_result, type = "l", main = "Scree Plot: Variance Explained by Principal Components")
+
+
+
+########### Differential Methylation analysis - Wilcoxon-rank-sum ##########
+# This code analyzes DNA methylation data for different "LINE1" elements. It separates the data into "Case" and "Control" groups, then performs a Wilcoxon rank-sum test for each unique "LINE1" element location to compare beta values between the groups. It checks for sufficient data before the test and handles cases where data is missing. Finally, it combines the results into a single table summarizing the p-value, statistic, and alternative hypothesis for each "LINE1" element
+The test is unpaired to separate cases and controls
+A smaller p-value indicates stronger evidence against the null hypothesis, suggesting that the observed effect is unlikely to occur by chance alone.
+LINE1Methylation[, wp := {
+  case_beta <- beta[group == "Case" & !is.na(beta)]
+  control_beta <- beta[group == "Control" & !is.na(beta)]
+  if (length(case_beta) > 0 & length(control_beta) > 0) {
+    wilcox.test(case_beta, control_beta)$p.value
+  } else {
+    NA
+  }
+}, by = .(chr, repStart, repEnd)]
+
+head(LINE1Methylation)
+
+## Plot Density plot of P value distribution
+ggplot(LINE1Methylation, aes(x = wp)) +
+  geom_density() +
+  labs(title = "Density Plot of P-values",
+       x = "P-value (wp)",
+       y = "Density") +
+  theme_minimal()
+
+
+##Significance threshold filtering 0.05
+#Extracts 203728 significant results from 38063587
+significance_threshold <- 0.005
+# Filter the rows where the p-value is below the significance threshold
+significant_LINE1Methylation <- LINE1Methylation[wp < significance_threshold, ]
+# View the head of the new data frame
+head(significant_LINE1Methylation)
+ggplot(significant_LINE1Methylation, aes(x = group, y = beta, fill = group)) +
+  geom_boxplot() +
+  labs(title = "Box Plot of Significant Beta Values Between Cases and Controls",
+       x = "Group",
+       y = "Beta Value") +
+  theme_minimal()
+
+
+
+
+
+########### Heatmap ###########
+#Generate heatmap of wp values deemed to be significant
+#reshapes significant_LINE1Methylation dataset into a wide format where each row represents a sample and each column represents a unique combination of chr, repStart, and LINE1id with the wp values filled in.
+wide_data <- dcast(significant_LINE1Methylation, sample ~ chr + repStart + LINE1id, value.var = "beta")
+setDF(wide_data)
+# Set the row names to the sample names
+rownames(wide_data) <- wide_data$sample
+wide_data <- wide_data[, -1]
+# make samples columns
+wide_data <- t(wide_data)
+filter_rows <- apply(wide_data, 1, function(x){sum(is.na(x))})
+#remove all LINE1s with missing data
+wide_data <- wide_data[filter_rows==0,]
+row_clustering <- hclust.vector(wide_data)
+# Create the heatmap
+aheatmap(wide_data, Rowv = row_clustering$order, Colv = TRUE, annCol = list(group=tstrsplit(colnames(wide_data), '_')[[2]]))
+aheatmap(wide_data, Rowv = row_clustering$order, Colv = TRUE, annCol = list(group=tstrsplit(colnames(wide_data), '_')[[2]]), scale="row", breaks = (-60:40)/10)
+
+
+### Save region list to file, for use in other scripts
+fwrite(significant_LINE1Methylation[, list(.N), by=list(chr, repStart, repEnd)], "significant_L1_regions.bed.gz", compress = "gzip", row.names = FALSE, col.names = FALSE, sep = "\t")
