@@ -1,0 +1,31 @@
+## Line 1 Methylation in the cfDNA of HCC patients
+
+# Load packages
+library(data.table)
+library(GenomicRanges)
+library(dplyr)
+library(ggplot2)
+library(progressr)
+library(furrr)
+library(GGally)
+library(stats)
+library(uwot)
+library(ggplot2)
+library(pheatmap)
+library(limma)
+library(NMF)
+library(fastcluster)
+
+
+
+#### Data Loading
+We downloaded the repeatmasker track from UCSC as a database dump in csv format.
+We now need to subset to the genomic coordinates of Line1 elements only:
+
+repeats <- fread("../Data/repeats.tsv.gz", header=TRUE, stringsAsFactors = TRUE)
+# Filter for Line1 repeats only
+repeats <- repeats[repFamily == "L1", .(genoName, genoStart, genoEnd, repName)]
+# make column names less insane, index by chr/start/end
+
+setnames(repeats, c("genoName", "genoStart", "genoEnd"), c("chr", "start", "end"))
+setkey(repeats, chr, start, end)
