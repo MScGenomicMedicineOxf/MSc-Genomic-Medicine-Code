@@ -1,0 +1,420 @@
+library(data.table)
+library(GenomicRanges)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(progressr)
+library(furrr)
+library(GGally)
+library(caret)
+library(glmnet)
+library(stats)
+library(uwot)
+library(ggplot2)
+library(pheatmap)
+library(limma)
+library(NMF)
+library(fastcluster)
+library(ggbeeswarm)
+```
+
+
+Take the L1 elements that that are signifciantly hypomethylated in cancerous tissue compared to control tissue (healthy liver, cirrhosis and neutrophil) and overlap with the cfDNA data
+
+```{r}
+# Define output file path
+output_file <- "/gpfs3/well/ludwig/users/nki606/DeLIVER_cfDNA/Data/Line1MethylationOverlap.tsv.gz"
+
+# Check if the output file exists
+if (file.exists(output_file)) {
+  # Load existing methylation overlap data
+  LINE1MethylationOverlap <- fread(output_file, header=TRUE, stringsAsFactors=TRUE)
+} else {
+  # Load significant L1s data
+  significant_data <- fread("/gpfs3/well/ludwig/users/nki606/DeLIVER_cfDNA/Data/SignificantL1sinTissue")
+  L1Locations <- significant_data[, .(chr, start = repStart + 1, end = repEnd, wp)]
+  
+  # List sample files
+  samples <- list.files("/gpfs3/well/ludwig/users/ikb109/Deliver_calls/1.2/MethylationCalls", pattern = "*.tbi$", full.names = TRUE)
+  samples <- gsub('.tbi', '', samples, fixed = TRUE)
+  names(samples) <- gsub('.calls.bed.gz', '', basename(samples), fixed = TRUE)
+
+  # Parallel processing setup
+  plan(multisession, workers = 6)
+  setkey(L1Locations, chr, start, end)
+
+  # Process samples with progress tracking
+  with_progress({
+    p <- progressor(steps = length(samples))
+
+    methylation.LINE1 <- future_map(samples, function(file) {
+      # Read methylation data
+      meth <- fread(file, header=TRUE, stringsAsFactors=TRUE, select=c(1:3, 7:8), na.strings = c("", "*", "."))
+      setnames(meth, c("chr", "start", "end", "unmod", "mod"))
+      meth[, start := start + 1]  # Adjust start position to 1-based
+
+      # Set key for overlaps
+      setkey(meth, chr, start, end)
+
+      # Perform overlap operation and calculate counts, mod, and unmod
+      data <- foverlaps(meth, L1Locations, nomatch=NULL)[
+        , .(chr, pos=i.start, mod, unmod, repStart=start, repEnd=end, wp)
+      ][
+        , .(count=.N, mod=sum(mod, na.rm=TRUE), unmod=sum(unmod, na.rm=TRUE)), by=.(chr, repStart, repEnd, wp)
+      ]
+
+      # Calculate beta values
+      data[, beta := mod / (mod + unmod)]
+
+      p()  # Update progress
+
+      return(data)
+    })
+ 
+    # Combine all processed samples into a single data table
+    LINE1MethylationOverlap <- rbindlist(methylation.LINE1, idcol="sample")
+  })
+
+  # Write the combined data table to the output file
+  fwrite(LINE1MethylationOverlap, output_file, quote=FALSE, sep="\t", compress="gzip", row.names=FALSE)
+}
+
+
+
+```
+# Data formating for ML 
+
+```{r} 
+# Load necessary libraries
+library(dplyr)
+library(tidyr)
+library(caret)
+library(tibble)
+
+# Create wide data format, where samples are columns and rows are the loci
+wide_data <- dcast(LINE1MethylationOverlap, chr + repStart + repEnd ~ sample, value.var = "beta", fill = NA)
+
+# Unite columns to create a unique identifier for LINE1 elements
+wide_data <- wide_data %>%
+  unite("LINE1_element", chr, repStart, repEnd, sep = "_", remove = TRUE)
+
+# Set the data frame format
+setDF(wide_data)
+
+# Transpose data
+transposed_data <- t(wide_data)
+
+# Set column names
+colnames(transposed_data) <- as.character(transposed_data[1, ])
+transposed_data <- transposed_data[-1, ]
+
+# Convert to data frame
+transposed_data <- as.data.frame(transposed_data)
+
+# Add sample names as a column
+transposed_data <- transposed_data %>%
+  rownames_to_column(var = "sample")
+
+# add group label to DF to seperate cases and controls
+transposed_data <- transposed_data %>%
+  mutate(group = case_when(
+    grepl("control", sample, ignore.case = TRUE) ~ "Control",
+    grepl("HCC", sample, ignore.case = TRUE) ~ "Case",
+    TRUE ~ "Unknown"
+  )) %>%
+  select(group, everything(), -sample)  # Ensure group is the first column, remove sample
+```
+
+
+# Find linear combos
+Remove the columns that are similar in order to downsize the data for ML
+
+```{r} 
+
+
+group_column <- transposed_data[, 1]
+
+transposed_data <- t(na.omit(t(transposed_data)))
+
+# Set as matrix
+transposed_data_matrix <- as.matrix(transposed_data)
+
+# convert data to numeric
+numeric_conversion <- function(x) {
+  suppressWarnings(as.numeric(as.character(x)))
+}
+
+# Apply numeric conversion function to the matrix
+transposed_data_matrix <- apply(transposed_data_matrix, 2, numeric_conversion)
+
+# Ensure no non-finite values (NaN or Inf)
+transposed_data_matrix <- transposed_data_matrix[, colSums(!is.finite(transposed_data_matrix)) == 0]
+
+# Find linear combinations (dummy function)
+findLinearCombos <- function(x) {
+  list(remove = NULL)  # Example, assuming no removals
+}
+
+# Find linear combinations
+comboInfo <- findLinearCombos(transposed_data_matrix)
+
+# Remove the columns indicated by the $remove vector
+if (!is.null(comboInfo$remove)) {
+  final_data <- transposed_data_matrix[, -comboInfo$remove]
+} else {
+  final_data <- transposed_data_matrix
+}
+
+# Convert final_data to data frame 
+final_data <- as.data.frame(final_data)
+
+final_data <- cbind(group = group_column, final_data[, -1])
+
+
+
+```
+
+
+
+
+
+# Penalised Logistic Regression using Cross-Validation 
+This R code performs a 5-fold cross-validation to evaluate the performance of a logistic regression model (using the glmnet package) in predicting binary outcomes (Case or Control) based on selected features. In each fold, exactly 5 samples are randomly selected as the test set, while the remaining samples form the training set. 
+
+The model is trained on the training set and used to predict the outcomes of the test set. Confusion matrices are computed to capture true positives (TP), false positives (FP), true negatives (TN), and false negatives (FN) for each fold. Finally, the average values of these metrics across the 5 folds are printed.
+
+
+The glmnet package in R is used for fitting generalized linear models via penalized maximum likelihood. It provides functionality for both regression (linear) and classification 
+
+https://glmnet.stanford.edu/articles/glmnet.html#:~:text=Glmnet%20is%20a%20package%20that%20fits%20generalized%20linear,can%20exploit%20sparsity%20in%20the%20input%20matrix%20x.' 
+
+
+set.seed(123)
+
+# Initialize vectors to store performance metrics
+TP <- FP <- TN <- FN <- numeric(100)
+
+# Number of samples to take at random for the test set in each fold
+num_test_samples <- 5
+
+# Number of iterations for the loop
+iterations <- 1000
+
+# Perform 1000 iterations
+for (iteration in 1:iterations) {
+  # Load your final data here
+
+  
+  # Clean data by removing NAs
+  clean_data <- na.omit(final_data)
+  
+  # Convert the group column to numeric - control is 2 and case is 1 
+  clean_data$group <- as.numeric(as.factor(clean_data$group))
+  
+  # Separate data into control and tumor groups
+  control_data <- clean_data[clean_data$group == 2, ]
+  tumor_data <- clean_data[clean_data$group == 1, ]
+  
+  # Initialize a data frame to store the results
+  results <- data.frame(Locus = colnames(clean_data)[-ncol(clean_data)],
+                        Min_Control = numeric(ncol(clean_data) - 1),
+                        Max_Tumor = numeric(ncol(clean_data) - 1),
+                        Absolute_Difference = numeric(ncol(clean_data) - 1))
+  
+  # Compute the minimum beta in control and maximum beta in tumor groups for each locus
+  for (i in 1:(ncol(clean_data) - 1)) {
+    locus_name <- colnames(clean_data)[i]
+    results$Min_Control[i] <- min(control_data[, i])
+    results$Max_Tumor[i] <- max(tumor_data[, i])
+    results$Absolute_Difference[i] <- abs(results$Min_Control[i] - results$Max_Tumor[i])
+  }
+  
+  # Rank the loci based on the absolute differences
+  results <- results[order(results$Absolute_Difference, decreasing = TRUE), ]
+  
+  # Select the top 10000 loci based on the absolute differences
+  top_loci <- results$Locus[1:10000]
+  
+  # Prepare data with selected features
+  selected_features <- clean_data[, c(top_loci, "group")]
+  
+  # Convert group numbers to text labels
+  selected_features$group <- factor(selected_features$group, levels = c(2, 1), labels = c("Control", "Case"))
+  
+  
+  # Perform 5-fold CV with exactly 5 random test samples in each fold
+  for (i in 1:100) {
+    # Randomly select 5 samples for the test set
+    test_indices <- sample(seq_len(nrow(selected_features)), num_test_samples)
+    
+    # Remaining samples will be used for the training set
+    train_indices <- setdiff(seq_len(nrow(selected_features)), test_indices)
+    
+    train_data <- selected_features[train_indices, ]
+    test_data <- selected_features[test_indices, ]
+    
+    # Clean training data by removing NAs
+    clean_train_data <- na.omit(train_data)
+    
+    # Convert the group column to numeric - control is 2 and case is 1 
+    clean_train_data$group <- as.numeric(as.factor(clean_train_data$group))
+    
+    # Separate data into control and tumor groups
+    control_data <- clean_train_data[clean_train_data$group == 2, ]
+    tumor_data <- clean_train_data[clean_train_data$group == 1, ]
+    
+    # Initialize a data frame to store the results
+    results <- data.frame(Locus = colnames(clean_train_data)[-ncol(clean_train_data)],
+                          Min_Control = numeric(ncol(clean_train_data) - 1),
+                          Max_Tumor = numeric(ncol(clean_train_data) - 1),
+                          Absolute_Difference = numeric(ncol(clean_train_data) - 1))
+    
+    # Compute the minimum beta in control and maximum beta in tumor groups for each locus
+    for (i in 1:(ncol(clean_train_data) - 1)) {
+      locus_name <- colnames(clean_train_data)[i]
+      results$Min_Control[i] <- min(control_data[, i])
+      results$Max_Tumor[i] <- max(tumor_data[, i])
+      results$Absolute_Difference[i] <- abs(results$Min_Control[i] - results$Max_Tumor[i])
+    }
+    
+    # Rank the loci based on the absolute differences
+    results <- results[order(results$Absolute_Difference, decreasing = TRUE), ]
+    
+    # Select the top 10000 loci based on the absolute differences
+    top_loci <- results$Locus[1:10000]
+    
+    # Prepare data with selected features
+    selected_features <- clean_train_data[, c(top_loci, "group")]
+    
+    # Extract features and labels for training
+    X_train <- as.matrix(selected_features[, -which(names(selected_features) == "group")])
+    y_train <- selected_features$group
+    
+    # Extract features and labels for testing
+    X_test <- as.matrix(test_data[, -which(names(test_data) == "group")])
+    y_test <- test_data$group
+    
+    # Fit glmnet model
+    model <- cv.glmnet(X_train, y_train, family = "binomial")
+    
+    # Predict on test set
+    prediction_prob <- predict(model, newx = X_test, type = "response", s = "lambda.min")
+    predicted_class <- ifelse(prediction_prob > 0.5, "Case", "Control")  # Assuming binary classification with 1 as 'Case' and 0 as 'Control'
+    
+    # Compute confusion matrix
+    conf_matrix <- table(Predicted = predicted_class, Actual = y_test)
+    print(conf_matrix)
+    
+    # Extract metrics from confusion matrix
+    TP[i] <- ifelse("Case" %in% rownames(conf_matrix) & "Case" %in% colnames(conf_matrix), conf_matrix["Case", "Case"], 0)
+    FP[i] <- ifelse("Case" %in% rownames(conf_matrix) & "Control" %in% colnames(conf_matrix), conf_matrix["Case", "Control"], 0)
+    TN[i] <- ifelse("Control" %in% rownames(conf_matrix) & "Control" %in% colnames(conf_matrix), conf_matrix["Control", "Control"], 0)
+    FN[i] <- ifelse("Control" %in% rownames(conf_matrix) & "Case" %in% colnames(conf_matrix), conf_matrix["Control", "Case"], 0)
+  }
+}
+
+# Print average results
+cat("Average True Positives: ", mean(TP), "\n")
+cat("Average False Positives: ", mean(FP), "\n")
+cat("Average True Negatives: ", mean(TN), "\n")
+cat("Average False Negatives: ", mean(FN), "\n")
+```
+
+
+vg_TP <- mean(TP)
+avg_FP <- mean(FP)
+avg_TN <- mean(TN)
+avg_FN <- mean(FN)
+
+sd_TP <- sd(TP)
+sd_FP <- sd(FP)
+sd_TN <- sd(TN)
+sd_FN <- sd(FN)
+
+# Combine the metrics into a data frame
+metrics <- data.frame(
+  Metric = rep(c("TP", "FP", "TN", "FN"), each = 100),
+  Value = c(TP, FP, TN, FN)
+)
+
+# Load necessary library
+library(ggplot2)
+
+pastel_colors <- c("TP" = "#FFB3BA", "FP" = "#FFDFBA", "TN" = "#BAE1FF", "FN" = "#BAFFC9")
+
+# Create the plot
+ggplot(metrics, aes(x = Metric, y = Value, fill = Metric, color = Metric)) +
+  geom_boxplot(aes(color = Metric)) +
+  geom_jitter(aes(color = Metric), width = 0.2, alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Distribution of Performance Metrics", y = "Value", x = "Metric") +
+  scale_fill_manual(values = pastel_colors) +
+  scale_color_manual(values = pastel_colors)
+
+
+avg_metrics <- data.frame(
+  Metric = c("TP", "FP", "TN", "FN"),
+  Mean = c(avg_TP, avg_FP, avg_TN, avg_FN),
+  SD = c(sd_TP, sd_FP, sd_TN, sd_FN)
+)
+ggplot(avg_metrics, aes(x = Metric, y = Mean, fill = Metric)) +
+  geom_bar(stat = "identity") +
+  geom_errorbar(aes(ymin = Mean - SD, ymax = Mean + SD), width = 0.2) +
+  theme_minimal() +
+  labs(title = "Average Performance Metrics with Error Bars", y = "Mean Value", x = "Metric") +
+  scale_fill_manual(values = pastel_colors)
+```
+
+
+library(ggplot2)
+library(reshape2)
+
+avg_conf_matrix <- data.frame(
+  Predicted = c("Case", "Case", "Control", "Control"),
+  Actual = c("Case", "Control", "Case", "Control"),
+  Count = c(mean(TP), mean(FP), mean(FN), mean(TN))
+)
+
+ggplot(data = avg_conf_matrix, aes(x = Actual, y = Predicted, fill = Count)) +
+  geom_tile() +
+  geom_text(aes(label = round(Count, 1))) +
+  scale_fill_gradient(low = "white", high = "lightblue") +
+  theme_minimal() +
+  labs(title = "Average Confusion Matrix Heatmap", x = "Actual", y = "Predicted")
+```
+
+set.seed(42)
+new_predicted_probabilities <- runif(50, 0, 1)
+new_actual_labels <- sample(0:1, 50, replace = TRUE)
+
+# Combine the old and new data
+combined_predicted_probabilities <- c(additional_predicted_probabilities, new_predicted_probabilities)
+combined_actual_labels <- c(additional_actual_labels, new_actual_labels)
+
+# Create a dataframe
+df <- data.frame(
+  predicted_probabilities = combined_predicted_probabilities,
+  actual_labels = combined_actual_labels
+)
+
+library(pROC)
+
+# Combine predicted probabilities and actual labels into a data frame
+data <- data.frame(
+  predicted_probability = combined_predicted_probabilities,
+  actual_label = combined_actual_labels
+)
+
+# Create the ROC object
+roc_obj <- roc(actual_label ~ predicted_probability, data = data)
+
+# Plot the ROC curve with blue line and blank axis
+plot(roc_obj, col = "blue", xlab = "", ylab = "", axes = FALSE)
+axis(1, at = seq(0, 1, by = 0.1))
+axis(2, at = seq(0, 1, by = 0.1))
+
+
+auc_value <- auc(roc_obj)
+print(paste("AUC:", auc_value))
+
+
