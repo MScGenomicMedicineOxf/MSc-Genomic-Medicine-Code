@@ -1,0 +1,336 @@
+library(data.table)
+library(GenomicRanges)
+library(dplyr)
+library(ggplot2)
+library(progressr)
+library(furrr)
+library(GGally)
+library(stats)
+library(uwot)
+library(ggplot2)
+library(pheatmap)
+library(limma)
+library(NMF)
+library(fastcluster)
+library(ggbeeswarm)
+
+Is the fact that some L1 loci are slightly hypomethylated in cancer cfDNA compared to cirrhosis reflected in lower methylation of these loci in tissue methylation data?
+
+To test this, I'll take the beta values fromthe TAPS atlas data of liver cancer, cirrhosis and normal, plus some blood cell types, and subset it to the previously defined L1 subsets, then plot the distribution of average beta values per category.
+
+
+
+# Data Loading
+tumour vs cirosis vs neutrophils
+biggest absolute difference 
+
+
+We downloaded the repeatmasker track from UCSC as a database dump in csv format.
+We now need to subset to the genomic coordinates of Line1 elements only:
+
+```{r Filter for LINE1 Elements, eval=FALSE, include=FALSE}
+repeats <- fread("../Data/repeats.tsv.gz", header=TRUE, stringsAsFactors = TRUE)
+# Filter for Line1 repeats only
+repeats <- repeats[repFamily == "L1"]
+# make column names less insane, index by chr/start/end
+setnames(repeats, c("genoName", "genoStart", "genoEnd"), c("chr", "start","end"))
+setkey(repeats, chr, start, end)
+```
+
+
+```{r Methylation Data Processing, echo=TRUE}
+output_file <- "../Data/Line1MethylationTissue"
+if(file.exists(output_file)) {
+  # If the file exists, read it into LINE1Methylation variable
+  Line1MethylationTissue <- read.delim("/gpfs3/well/ludwig/users/nki606/DeLIVER_cfDNA/Data/Line1MethylationTissue")
+} else {
+
+samples <- list.files("/well/ludwig/users/ikb109/Atlas/Results/1.0/MethylationCalls", pattern = ".*calls.bed.gz.tbi$", full.names = TRUE)
+samples <- gsub('.tbi', '', samples, fixed = TRUE)
+names(samples) <- gsub('_md.calls.bed.gz', '', basename(samples), fixed = TRUE)
+
+# Subset samples based on names containing "liver" or "neutrophil"
+subset_names <- grepl("liver", names(samples), ignore.case = TRUE) | grepl("Neutrophils", names(samples), ignore.case = TRUE)
+samples <- samples[subset_names]
+
+# Remove anomalous data point
+samples <- samples[names(samples) != "CD563569_Liver"]
+
+# Parallel processing setup
+plan(multisession, workers = 6)
+  repeats[, start := start + 1]
+  
+  setkey(repeats, chr, start, end)
+  
+  # Process with progress
+  with_progress({
+    p <- progressor(steps = length(samples))
+    # Map over samples and process methylation data
+    methylation.LINE1 <- future_map(samples, function(file) {
+      # Read data from file
+      meth <- fread(file, header=TRUE, stringsAsFactors=TRUE, select=c(1:3, 7:8), na.strings = c("", "*", "."))
+      setnames(meth, c("chr", "start", "end", "unmod", "mod"))
+      # Convert mod and unmod columns to numeric
+      meth[, start := start + 1]
+      setkey(meth, chr, start, end)
+      # Perform overlap operation with repeats data and calculate counts, mod, and unmod
+      data <- foverlaps(meth, repeats, nomatch=NULL)[, .(chr, pos=i.start, mod, unmod, LINE1id=repName, repStart=start, repEnd=end)][, .(count=.N, mod=sum(mod, na.rm = TRUE), unmod=sum(unmod, na.rm = TRUE)), by=.(chr, repStart, repEnd, LINE1id)]
+
+      data[, beta := mod/(mod+unmod), by=.(chr, repStart=repStart-1, repEnd, LINE1id)]
+
+      p() # Update progress
+
+      # Return data with beta values included
+      return(data)
+    })
+  })
+
+  # Combine all processed samples into a single data table
+  LINE1MethylationTissue <- rbindlist(methylation.LINE1, idcol = "sample")
+
+  # Write the combined data table to the file
+  fwrite(LINE1MethylationTissue, output_file, quote = FALSE, sep = "\t", compress = "gzip", row.names = FALSE)
+}
+```
+
+## Plot
+
+```{r}
+
+
+## add group names
+setDT(Line1MethylationTissue)
+Line1MethylationTissue[, group := ifelse(grepl("Liver-Cirrhosis", sample, ignore.case = TRUE), "cirrhosis",
+                                         ifelse(grepl("Liver-Tumour", sample, ignore.case = TRUE), "cancer",
+                                                ifelse(grepl("Liver", sample, ignore.case = TRUE), "liver",
+                                                       ifelse(grepl("Neutrophil", sample, ignore.case = TRUE), "neutrophil", 
+                                                              NA_character_))))]
+
+# Define pastel colors
+pastel_colors <- c("cirrhosis" = "#8797D4",  
+                   "cancer" = "#DF81A2",     
+                   "liver" = "#EBAE83",      
+                   "neutrophil" = "#7ED6CA") 
+
+# Plot with different colors for groups
+ggplot(pca_df, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = pastel_colors) +
+  labs(title = "", x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+```
+
+```{r}
+mean_beta <- Line1MethylationTissue[, .(mb = mean(beta, na.rm = TRUE)), by = .(sample, group)]
+
+# Plot with geom_beeswarm and custom pastel colors
+ggplot(mean_beta, aes(x=group, y=mb, color=group)) + 
+  geom_beeswarm() +
+  scale_color_manual(values=pastel_colors) +
+  theme_minimal() +
+  labs(title="Mean Beta Values by Tissue Group",
+       x="Tissue Group",
+       y="Mean Beta Value",
+       color="Group")
+```
+
+```{r}
+pivot_df <- dcast(Line1MethylationTissue, sample ~ chr + repStart + repEnd, value.var = "beta", fill = NA)
+
+# Convert pivot_df to a data.table (if not already)
+setDF(pivot_df)
+
+# Extract sample names and group labels
+sample_names <- pivot_df$sample  # Extract sample names
+group_labels <- Line1MethylationTissue$group[match(sample_names, Line1MethylationTissue$sample)]  # Match group labels to samples
+
+# Ensure chr + repStart + repEnd columns are used as rownames for clarity
+rownames(pivot_df) <- sample_names
+pivot_df <- t(pivot_df[, -1])  # Transpose and remove the sample column
+
+# Remove rows with all zeros or NAs
+null_rows <- apply(pivot_df, 1, function(col) all(col == 0 | is.na(col)))
+pivot_df <- pivot_df[!null_rows, ]
+
+# Remove columns with zero variance
+var_rows <- apply(pivot_df, 1, var, na.rm = TRUE) > 0
+pivot_df <- pivot_df[var_rows, ]
+
+# Remove rows with NA values
+pivot_df <- pivot_df[complete.cases(pivot_df), ]
+
+# Perform PCA
+pca_result <- prcomp(t(pivot_df), scale. = TRUE)
+
+# Create a data frame for plotting PCA results
+pca_df <- data.frame(pca_result$x)
+pca_df$sample <- sample_names  # Assign correct sample names
+pca_df$group <- group_labels
+
+# Plot PCA
+ggplot(pca_df, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 3) +
+  labs(title = "PCA Plot", x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+
+```
+
+
+
+
+
+
+
+## Wilcoxon
+
+- Define the tissue catgorys in the data set as cancer , cirrhosis, healthy liver and neutrophil
+- Run a one sided wilcoxon to identify significant hypomethylation in the cancer tissue compared to the 'control' tissue denoted as liver cirrohisis, neutrophils and healthy liver tissue 
+
+```{r}
+
+# Categorize samples as case or control based on their description
+Line1MethylationTissue[, category := fifelse(grepl("Liver-Tumour", sample, ignore.case = TRUE), "case", "control")]
+
+# Subset the data based on group
+tumor_data <- Line1MethylationTissue[group == "cancer"]
+cirrhosis_data <- Line1MethylationTissue[group == "cirrhosis"]
+liver_data <- Line1MethylationTissue[group == "liver"]
+neutrophil_data <- Line1MethylationTissue[group == "neutrophil"]
+
+# Combine control data groups including neutrophil
+control_data <- rbind(cirrhosis_data, liver_data, neutrophil_data)
+
+# Combine all relevant data
+combined_data <- rbind(control_data, tumor_data)
+
+# Calculate one-sided Wilcoxon p-value for each group of (chr, repStart, repEnd) to find differentially hypomethylated regions
+signif_L1s <- combined_data[, .(wp = {
+  case_beta <- beta[category == "case" & !is.na(beta)]
+  control_beta <- beta[category == "control" & !is.na(beta)]
+  if (length(case_beta) > 0 & length(control_beta) > 0) {
+    wilcox.test(case_beta, control_beta, alternative = "less", exact = FALSE)$p.value
+  } else {
+    NA_real_
+  }
+}), by = .(chr, repStart, repEnd)]
+
+# Merge based on common columns chr, repStart, and repEnd
+combined_data <- merge(combined_data, signif_L1s, by = c("chr", "repStart", "repEnd"), all.x = TRUE)
+
+# Print the merged data
+print(head(combined_data))
+
+
+
+  
+
+```
+
+
+Plot p-value distribution
+
+```{r}
+ggplot(signif_L1s, aes(x = wp)) +
+  geom_density() +
+  labs(title = "Density Plot of P-values",
+       x = "P-value (wp)",
+       y = "Density") +
+  theme_minimal()
+```
+
+
+# Boxplot
+Significant threshold filtering 0.05 to find LINE1 loci that are signifciantly hypomethylated in cancerous tissue compared to controls 
+Saves this to a new file for later analysis with cfDNA data 
+
+Boxplot the beta values deemed to be signficiat in all tissues 
+
+
+```{r}
+
+#### Filtering on cancer tissue only #### 
+significance_threshold <- 0.05
+
+# Filter the rows where the p-value is below the significance threshold
+significant_data <- combined_data[wp < significance_threshold, ]
+
+# Further filter the significant data to include only cancer tissue samples
+significant_cancer_data <- significant_data[category == "case", ]
+
+
+# Save this to a separate file
+##### Save to CSV
+output_path <- "../Data"
+
+
+# Construct the full file name
+output_file <- file.path(output_path, "SignificantL1sinTissue")
+
+# Save data to CSV
+write.csv(significant_cancer_data, file = output_file, row.names = FALSE)
+
+
+#####  Filteiring on all tissue types ####
+significance_threshold <- 0.05
+
+# Filter the rows where the p-value is below the significance threshold
+significant_data <- combined_data[wp < significance_threshold, ]
+
+# View the head of the new data frame
+head(significant_data)
+
+ggplot(significant_data, aes(x=group, y=beta, fill=group)) + 
+  geom_boxplot() +
+  scale_fill_manual(values=pastel_colors) +
+  theme_minimal() +
+  labs(title="Beta Values by Tissue Group",
+       x="Tissue Group",
+       y="Beta Value",
+       fill="Group")
+
+stats <- significant_data[, .(
+  Median = median(beta, na.rm = TRUE),
+  Mean = mean(beta, na.rm = TRUE),
+  IQR = IQR(beta, na.rm = TRUE)
+), by = group]
+
+# Print the statistics
+print(stats)
+
+
+
+
+
+
+```
+
+
+
+# Heatmap
+Heatmap of signficant data for all tissue types 
+```{r echo=TRUE, fig.height=10, fig.width=8}
+
+selected_rows <- significant_data[!is.na(wp) & wp < 0.005 & chr %in% paste0("chr", 1:22), paste(chr, repStart, repEnd, beta, sep="_")]
+
+wide_data <- dcast(selected_rows, sample ~ chr + repStart + repEnd, value.var = "beta")
+
+setDF(wide_data)
+
+# Set the row names to the sample names
+rownames(wide_data) <- wide_data$sample
+wide_data <- wide_data[, -1]
+
+# make samples columns
+wide_data <- t(wide_data)
+
+wide_data <- wide_data[selected_rows, ]
+filter_rows <- apply(wide_data, 1, function(x){sum(is.na(x))})
+
+#remove all LINE1s with missing data
+wide_data <- wide_data[filter_rows==0,]
+
+row_clustering <- hclust.vector(wide_data)
+
+# Create the heatmap
+aheatmap(wide_data, Rowv = row_clustering$order, Colv = TRUE, annCol = list(group=tstrsplit(colnames(wide_data), '_')[[2]]), scale="none")
+```
